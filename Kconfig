@@ -1,0 +1,6 @@
+config OPENMV_RPC
+    bool "Enable the OpenMV RPC library"
+    depends on UART_ASYNC_API
+    help
+      This library can be used to interface with OpenMV devices through
+      the OpenMV RPC protocol over UART.
