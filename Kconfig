@@ -4,3 +4,11 @@ config OPENMV_RPC
     help
       This library can be used to interface with OpenMV devices through
       the OpenMV RPC protocol over UART.
+
+if OPENMV_RPC
+
+config OPENMV_RPC_RESULT_PAYLOAD_SIZE
+    int "Maximum size of result payload"
+    default 1024
+
+endif

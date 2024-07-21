@@ -38,6 +38,12 @@ LOG_MODULE_REGISTER(openmv_rpc, LOG_LEVEL_INF);
 #define OPENMV_RPC_CRC16_POLY 0x1021
 #define OPENMV_RPC_CRC16_SEED 0xFFFF
 
+#define OPENMV_RPC_MAGIC_SIZE sizeof(uint16_t)
+#define OPENMV_RPC_CRC16_SIZE sizeof(uint16_t)
+
+#define OPENMV_RPC_RESULT_DATA_PACKET_SIZE \
+    (OPENMV_RPC_MAGIC_SIZE + CONFIG_OPENMV_RPC_RESULT_PAYLOAD_SIZE + OPENMV_RPC_CRC16_SIZE)
+
 struct openmv_rpc_empty_packet
 {
     uint16_t magic;
@@ -67,19 +73,8 @@ enum openmv_result_rx_state
     OPENMV_RESULT_WAITING_FOR_CRC
 };
 
-/* Result payload is received in multiple parts to support user-provided,
-   variable-length buffers */
-struct openmv_result_data_packet
-{
-    uint16_t magic;
-    uint16_t crc16;
-    enum openmv_result_rx_state state;
-    size_t payload_len;
-    void *payload;
-};
-
 static const struct device *const rpc_uart_dev = DEVICE_DT_GET(DT_CHOSEN(openmv_rpc_uart));
-static struct openmv_result_data_packet result_data;
+static uint8_t result_data_buffer[OPENMV_RPC_RESULT_DATA_PACKET_SIZE];
 
 struct k_poll_signal uart_rx_sig;
 struct k_poll_signal uart_tx_sig;
@@ -250,27 +245,36 @@ static int openmv_rpc_get_result(void *buf, size_t buf_len)
         return -EFBIG;
     }
 
-    /* Send Result Data packet and wait for response payload. The response is received
-       in multiple parts (magic, payload, CRC), in order to support a user provided
-       payload buffer. */
+    /* Send Result Data packet and wait for response payload. The response is received in a large
+       buffer, verified, and then the payload is copied into the user provided buffer. */
 
     struct openmv_rpc_empty_packet result_data_request =
         openmv_rpc_basic_packet(OPENMV_RPC_RESULT_DATA_PACKET_MAGIC);
 
-    result_data.magic = 0;
-    result_data.crc16 = 0;
-    result_data.payload = buf;
-    result_data.payload_len = result_ack.payload_len;
-    result_data.state = OPENMV_RESULT_WAITING_FOR_MAGIC;
-
     openmv_rpc_tranceive(&result_data_request,
                          sizeof(result_data_request),
-                         &result_data.magic,
-                         sizeof(result_data.magic));
+                         result_data_buffer,
+                         sizeof(uint16_t) + result_ack.payload_len + sizeof(uint16_t));
 
-    /* Ensure the state is reset in case of error */
+    LOG_INF("Payload length: %d", result_ack.payload_len);
 
-    result_data.state = OPENMV_RESULT_IDLE;
+    /* Verify CRC */
+
+    uint16_t calculated_crc = crc16(OPENMV_RPC_CRC16_POLY,
+                                    OPENMV_RPC_CRC16_SEED,
+                                    result_data_buffer,
+                                    sizeof(uint16_t) + result_ack.payload_len);
+    uint16_t received_crc =
+        *((uint16_t *) (result_data_buffer + sizeof(uint16_t) + result_ack.payload_len));
+
+    if (calculated_crc != received_crc)
+    {
+        return -EBADMSG;
+    }
+
+    /* Copy payload to user buffer */
+
+    memcpy(buf, result_data_buffer + sizeof(uint16_t), result_ack.payload_len);
 
     return 0;
 }
@@ -299,28 +303,6 @@ static void uart_callback(const struct device *dev, struct uart_event *evt, void
             break;
         case UART_RX_STOPPED:
             k_poll_signal_raise(&uart_rx_sig, evt->data.rx_stop.reason);
-            break;
-        case UART_RX_BUF_REQUEST:
-            /* If we are in the process of receiving result data,
-               then provide the next buffer */
-            switch (result_data.state)
-            {
-                case OPENMV_RESULT_WAITING_FOR_MAGIC:
-                    uart_rx_buf_rsp(rpc_uart_dev, result_data.payload, result_data.payload_len);
-                    result_data.state = OPENMV_RESULT_WAITING_FOR_PAYLOAD;
-                    break;
-                case OPENMV_RESULT_WAITING_FOR_PAYLOAD:
-                    uart_rx_buf_rsp(rpc_uart_dev,
-                                    (uint8_t *) &result_data.crc16,
-                                    sizeof(result_data.crc16));
-                    result_data.state = OPENMV_RESULT_WAITING_FOR_CRC;
-                    break;
-                case OPENMV_RESULT_WAITING_FOR_CRC:
-                    result_data.state = OPENMV_RESULT_IDLE;
-                    break;
-                default:
-                    break;
-            }
             break;
         case UART_TX_DONE:
             k_poll_signal_raise(&uart_tx_sig, 0);
