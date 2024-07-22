@@ -123,15 +123,15 @@ static void openmv_rpc_tx(const void *data, size_t len)
     k_poll(&done, 1, K_FOREVER);
 }
 
-static void openmv_rpc_tranceive(const void *tx_buf,
-                                 size_t tx_buf_len,
-                                 void *rx_buf,
-                                 size_t rx_buf_len)
+static int openmv_rpc_tranceive(const void *tx_buf,
+                                size_t tx_buf_len,
+                                void *rx_buf,
+                                size_t rx_buf_len)
 {
     flush_uart();
     k_poll_signal_reset(&uart_rx_sig);
 
-    uart_rx_enable(rpc_uart_dev, rx_buf, rx_buf_len, 100000);
+    uart_rx_enable(rpc_uart_dev, rx_buf, rx_buf_len, 5000);
 
     uart_tx(rpc_uart_dev, tx_buf, tx_buf_len, SYS_FOREVER_US);
 
@@ -145,20 +145,27 @@ static void openmv_rpc_tranceive(const void *tx_buf,
     if (-EAGAIN == err)
     {
         LOG_WRN("Read timedout");
+        return err;
     }
     else if (uart_rx_sig.result != 0)
     {
         LOG_ERR("Received UART rx event %d", uart_rx_sig.result);
+        return -EIO;
     }
+
+    return 0;
 }
 
-static bool openmv_rpc_send_with_basic_ack(const void *tx_buf,
-                                           size_t tx_buf_len,
-                                           uint16_t ack_value)
+static int openmv_rpc_send_with_basic_ack(const void *tx_buf, size_t tx_buf_len, uint16_t ack_value)
 {
     struct openmv_rpc_empty_packet ack = {0};
 
-    openmv_rpc_tranceive(tx_buf, tx_buf_len, &ack, sizeof(ack));
+    int err = openmv_rpc_tranceive(tx_buf, tx_buf_len, &ack, sizeof(ack));
+
+    if (err != 0)
+    {
+        return err;
+    }
 
     uint16_t calculated_crc = crc16(OPENMV_RPC_CRC16_POLY,
                                     OPENMV_RPC_CRC16_SEED,
@@ -167,15 +174,15 @@ static bool openmv_rpc_send_with_basic_ack(const void *tx_buf,
 
     if (calculated_crc != ack.crc16)
     {
-        return false;
+        return -EBADMSG;
     }
 
     if (ack.magic != ack_value)
     {
-        return false;
+        return -EBADRQC;
     }
 
-    return true;
+    return 0;
 }
 
 static int openmv_rpc_send_command(const char *command, const void *payload, size_t payload_len)
@@ -200,7 +207,13 @@ static int openmv_rpc_send_command(const char *command, const void *payload, siz
 
     /* Write Command Header packet and wait for ack */
 
-    openmv_rpc_send_with_basic_ack(&pkt, sizeof(pkt), OPENMV_RPC_COMMAND_HEADER_PACKET_MAGIC);
+    int err =
+        openmv_rpc_send_with_basic_ack(&pkt, sizeof(pkt), OPENMV_RPC_COMMAND_HEADER_PACKET_MAGIC);
+
+    if (err != 0)
+    {
+        return err;
+    }
 
     /* Write Command Data packet magic */
 
@@ -222,9 +235,14 @@ static int openmv_rpc_send_command(const char *command, const void *payload, siz
                                     sizeof(data_packet_magic));
     data_pkt_crc16 = crc16(OPENMV_RPC_CRC16_POLY, data_pkt_crc16, payload, payload_len);
 
-    openmv_rpc_send_with_basic_ack(&data_pkt_crc16,
-                                   sizeof(data_pkt_crc16),
-                                   OPENMV_RPC_COMMAND_DATA_PACKET_MAGIC);
+    err = openmv_rpc_send_with_basic_ack(&data_pkt_crc16,
+                                         sizeof(data_pkt_crc16),
+                                         OPENMV_RPC_COMMAND_DATA_PACKET_MAGIC);
+    if (err != 0)
+    {
+        return err;
+    }
+
 
     return 0;
 }
@@ -237,7 +255,14 @@ static int openmv_rpc_get_result(void *buf, size_t buf_len)
         openmv_rpc_basic_packet(OPENMV_RPC_RESULT_HEADER_PACKET_MAGIC);
     struct openmv_rpc_result_header_ack result_ack = {0};
 
-    openmv_rpc_tranceive(&result_header, sizeof(result_header), &result_ack, sizeof(result_ack));
+    int err = openmv_rpc_tranceive(&result_header,
+                                   sizeof(result_header),
+                                   &result_ack,
+                                   sizeof(result_ack));
+    if (err != 0)
+    {
+        return err;
+    }
 
     if (result_ack.payload_len > buf_len)
     {
@@ -251,12 +276,15 @@ static int openmv_rpc_get_result(void *buf, size_t buf_len)
     struct openmv_rpc_empty_packet result_data_request =
         openmv_rpc_basic_packet(OPENMV_RPC_RESULT_DATA_PACKET_MAGIC);
 
-    openmv_rpc_tranceive(&result_data_request,
-                         sizeof(result_data_request),
-                         result_data_buffer,
-                         sizeof(uint16_t) + result_ack.payload_len + sizeof(uint16_t));
+    err = openmv_rpc_tranceive(&result_data_request,
+                               sizeof(result_data_request),
+                               result_data_buffer,
+                               sizeof(uint16_t) + result_ack.payload_len + sizeof(uint16_t));
 
-    LOG_INF("Payload length: %d", result_ack.payload_len);
+    if (err != 0)
+    {
+        return err;
+    }
 
     /* Verify CRC */
 
@@ -265,7 +293,7 @@ static int openmv_rpc_get_result(void *buf, size_t buf_len)
                                     result_data_buffer,
                                     sizeof(uint16_t) + result_ack.payload_len);
     uint16_t received_crc =
-        *((uint16_t *) (result_data_buffer + sizeof(uint16_t) + result_ack.payload_len));
+        *((uint16_t *) (result_data_buffer + OPENMV_RPC_MAGIC_SIZE + result_ack.payload_len));
 
     if (calculated_crc != received_crc)
     {
@@ -274,7 +302,7 @@ static int openmv_rpc_get_result(void *buf, size_t buf_len)
 
     /* Copy payload to user buffer */
 
-    memcpy(buf, result_data_buffer + sizeof(uint16_t), result_ack.payload_len);
+    memcpy(buf, result_data_buffer + OPENMV_RPC_MAGIC_SIZE, result_ack.payload_len);
 
     return 0;
 }
@@ -283,11 +311,50 @@ int openmv_rpc_call(const char *command,
                     const void *command_payload,
                     size_t command_payload_len,
                     void *result_payload,
-                    size_t result_payload_len)
+                    size_t result_payload_len,
+                    k_timeout_t timeout)
 {
-    openmv_rpc_send_command(command, command_payload, command_payload_len);
+    if (result_payload_len > CONFIG_OPENMV_RPC_RESULT_PAYLOAD_SIZE)
+    {
+        return -EFBIG;
+    }
 
-    openmv_rpc_get_result(result_payload, result_payload_len);
+    k_timepoint_t expiration_point = sys_timepoint_calc(timeout);
+
+    int err = 0;
+
+    while (!sys_timepoint_expired(expiration_point))
+    {
+        err = openmv_rpc_send_command(command, command_payload, command_payload_len);
+        if (err != 0)
+        {
+            LOG_WRN("Could not send command (err = %d), retrying", err);
+            k_sleep(K_MSEC(3));
+        }
+        else
+        {
+            break;
+        }
+    }
+
+    while (!sys_timepoint_expired(expiration_point))
+    {
+        err = openmv_rpc_get_result(result_payload, result_payload_len);
+        if (err != 0)
+        {
+            LOG_WRN("Could not get result (err = %d), retrying", err);
+            k_sleep(K_MSEC(3));
+        }
+        else
+        {
+            break;
+        }
+    }
+
+    if (sys_timepoint_expired(expiration_point))
+    {
+        return -ETIMEDOUT;
+    }
 
     return 0;
 }
