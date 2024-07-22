@@ -131,14 +131,14 @@ static int openmv_rpc_tranceive(const void *tx_buf,
     flush_uart();
     k_poll_signal_reset(&uart_rx_sig);
 
-    uart_rx_enable(rpc_uart_dev, rx_buf, rx_buf_len, 5000);
+    uart_rx_enable(rpc_uart_dev, rx_buf, rx_buf_len, 30000);
 
     uart_tx(rpc_uart_dev, tx_buf, tx_buf_len, SYS_FOREVER_US);
 
     struct k_poll_event done =
         K_POLL_EVENT_INITIALIZER(K_POLL_TYPE_SIGNAL, K_POLL_MODE_NOTIFY_ONLY, &uart_rx_sig);
 
-    int err = k_poll(&done, 1, K_MSEC(5));
+    int err = k_poll(&done, 1, K_MSEC(30));
 
     uart_rx_disable(rpc_uart_dev);
 
